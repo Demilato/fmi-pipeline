@@ -1,0 +1,7 @@
+fmi-weather-client==1.0.0
+confluent-kafka==2.15.1
+google-cloud-bigquery==3.46.1
+pandas==3.0.6
+pyarrow==25.0.1
+db-dtypes==1.7.2
+streamlit==1.65.0

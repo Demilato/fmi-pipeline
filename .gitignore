@@ -1,0 +1,25 @@
+# Secrets: never commit
+.env
+secrets/
+*.json
+*gcp-key*.json
+*service-account*.json
+
+# Airflow runtime files
+airflow/logs/*
+!airflow/logs/.gitkeep
+airflow/config/airflow.cfg
+airflow/plugins/__pycache__/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/

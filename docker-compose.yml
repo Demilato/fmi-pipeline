@@ -1,0 +1,257 @@
+# FMI weather pipeline: Kafka (KRaft) + producer + consumer + Airflow (LocalExecutor) + Streamlit.
+# Runs on one CSC cPouta VM. Start with:  docker compose up -d --build
+# Web UIs are bound to 127.0.0.1 only; reach them through the SSH tunnel (see docs/csc-setup.md).
+name: fmi-pipeline
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-gcp-key: &gcp-key
+  type: bind
+  source: ${GCP_KEY_FILE:?Set GCP_KEY_FILE in .env}
+  target: /secrets/gcp-key.json
+  read_only: true
+  bind:
+    create_host_path: false # fail loudly instead of creating an empty directory
+
+x-bigquery-env: &bigquery-env
+  GCP_PROJECT_ID: ${GCP_PROJECT_ID:?Set GCP_PROJECT_ID in .env}
+  BQ_LOCATION: ${BQ_LOCATION:-europe-north1}
+  BQ_RAW_DATASET: ${BQ_RAW_DATASET:-fmi_raw}
+  BQ_DAILY_DATASET: ${BQ_DAILY_DATASET:-fmi_daily}
+  BQ_LONGTERM_DATASET: ${BQ_LONGTERM_DATASET:-fmi_longterm}
+  BQ_MAX_BYTES_BILLED: ${BQ_MAX_BYTES_BILLED:-1000000000}
+  LONGTERM_STATIONS: ${LONGTERM_STATIONS:-100971,101124,101339,101786,101932}
+  GOOGLE_APPLICATION_CREDENTIALS: /secrets/gcp-key.json
+
+x-app: &app
+  build: ./app
+  image: fmi-pipeline-app:latest
+  restart: unless-stopped
+  logging: *logging
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.3.2
+  restart: unless-stopped
+  logging: *logging
+  user: "${AIRFLOW_UID:-1000}:0"
+  environment: &airflow-env
+    <<: *bigquery-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${POSTGRES_PASSWORD:?Run scripts/init_env.sh}@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?Run scripts/init_env.sh}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:?Run scripts/init_env.sh}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?Run scripts/init_env.sh}
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW_CONFIG: /opt/airflow/config/airflow.cfg
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/config:/opt/airflow/config
+    - ./airflow/plugins:/opt/airflow/plugins
+    - *gcp-key
+  depends_on: &airflow-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- Kafka (single broker, KRaft)
+  kafka:
+    image: apache/kafka:4.3.1
+    hostname: kafka
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      CLUSTER_ID: mvVQKv4KTf6fH23mRPsA7Q
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  kafka-init:
+    image: apache/kafka:4.3.1
+    restart: "no"
+    logging: *logging
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic "${KAFKA_TOPIC:-fmi-observations}" --partitions 1 --replication-factor 1 \
+          --config retention.ms=604800000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "${KAFKA_TOPIC:-fmi-observations}"
+
+  # ---------------------------------------------------------------- FMI -> Kafka -> BigQuery
+  producer:
+    <<: *app
+    command: ["python", "-m", "fmi_pipeline.producer"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-fmi-observations}
+      STATIONS_CSV: /data/FMI_stations.csv
+      POLL_INTERVAL_MINUTES: ${POLL_INTERVAL_MINUTES:-20}
+      POLL_OFFSET_MINUTES: ${POLL_OFFSET_MINUTES:-8}
+      FMI_MAX_REQUESTS_PER_SECOND: ${FMI_MAX_REQUESTS_PER_SECOND:-1.5}
+      FMI_DAILY_REQUEST_BUDGET: ${FMI_DAILY_REQUEST_BUDGET:-19000}
+    volumes:
+      - ./data:/data:ro
+      - producer-state:/state
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  consumer:
+    <<: *app
+    command: ["python", "-m", "fmi_pipeline.consumer"]
+    environment:
+      <<: *bigquery-env
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-fmi-observations}
+    volumes:
+      - *gcp-key
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  dashboard:
+    <<: *app
+    command:
+      - streamlit
+      - run
+      - dashboard/app.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+    environment:
+      <<: *bigquery-env
+    volumes:
+      - *gcp-key
+    ports:
+      - "127.0.0.1:8501:8501"
+
+  # ---------------------------------------------------------------- Airflow
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run scripts/init_env.sh}
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+  airflow-init:
+    <<: *airflow-common
+    restart: "no"
+    user: "0:0"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/{logs,dags,plugins,config}
+        /entrypoint airflow version
+        /entrypoint airflow config list > /dev/null
+        chown -R "${AIRFLOW_UID:-1000}:0" /opt/airflow/{logs,plugins,config}
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?Run scripts/init_env.sh}
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Ad-hoc Airflow CLI: docker compose run --rm airflow-cli dags list
+  airflow-cli:
+    <<: *airflow-common
+    profiles: ["debug"]
+    restart: "no"
+    command: ["bash", "-c", "airflow"]
+
+volumes:
+  kafka-data:
+  producer-state:
+  postgres-db-volume:
