@@ -1,8 +1,11 @@
 # One image for the producer, the consumer and the dashboard (different commands in docker-compose.yml).
 FROM python:3.12-slim
 
+# PYTHONPATH: `streamlit run dashboard/app.py` only puts dashboard/ on the import path,
+# so /app must be added for `import fmi_pipeline` to work in the dashboard.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 

@@ -55,3 +55,22 @@ def test_dashboard_renders(monkeypatch):
     assert metrics["Duplicates removed"] == "144"
     assert len(at.dataframe) == 2  # recent records + quality report
     assert not [i.value for i in at.info]  # every tab had data
+
+
+def test_dashboard_imports_work_like_in_the_container():
+    """`streamlit run dashboard/app.py` puts only dashboard/ on sys.path (not the working directory),
+    so the image must set PYTHONPATH for `import fmi_pipeline` to work."""
+    import re
+    import subprocess
+    import sys
+
+    app_dir = APP.parents[1]
+    dockerfile = (app_dir / "Dockerfile").read_text()
+    match = re.search(r"PYTHONPATH=(\S+)", dockerfile)
+    assert match and match.group(1) == "/app", "Dockerfile must set PYTHONPATH=/app"
+
+    # /app in the image corresponds to app/ in the repo
+    code = "import sys; sys.path[0] = 'dashboard'; import fmi_pipeline.bq, fmi_pipeline.config"
+    env = {"PATH": "", "PYTHONPATH": str(app_dir)}
+    result = subprocess.run([sys.executable, "-c", code], cwd=app_dir, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
